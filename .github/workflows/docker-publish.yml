@@ -100,10 +100,11 @@ jobs:
       - name: 安装 Node
         uses: actions/setup-node@v4
         with:
-          # 必须 >= 22.12.0。仓库没有前端锁文件，依赖按最新版解析，
-          # 其中 commander@15 声明了 engines.node ">=22.12.0"；
-          # 用 Node 20 会在 yarn install 阶段直接报 "Found incompatible module"。
-          node-version: '22'
+          # 固定 Node 20。
+          # 注意：仓库没有前端锁文件，yarn 会按最新版解析依赖，其中 commander@15
+          # 声明了 engines.node ">=22.12.0"，所以下面的 install 必须带
+          # --ignore-engines 才能装下去。若将来这步报错，把这里改成 '22' 即可。
+          node-version: '20'
           cache: 'yarn'
           cache-dependency-path: 'app/package.json'
 
@@ -112,15 +113,20 @@ jobs:
         run: |
           # app/.gitignore 忽略了 yarn.lock，仓库里没有锁文件，
           # 所以不能加 --frozen-lockfile，只能按 package.json 解析安装。
-          yarn install --network-timeout 600000
+          #
+          # --ignore-engines：跳过依赖声明的 engines 校验。无锁文件时会解析到
+          # commander@15（要求 Node >= 22.12.0），而我们固定用 Node 20，
+          # 不加这个参数就会以 "Found incompatible module" 中断。
+          yarn install --ignore-engines --network-timeout 600000
           yarn build
           # 备注1：若 yarn 在 runner 上不可用，换成
           #   npm install --legacy-peer-deps && npm run build
           # 备注2：build 脚本是 "vue-tsc --noEmit && vite build"，
           #   会先做全量类型检查。若因类型错误导致构建中断，
           #   可临时改成 npx vite build 先跑通，类型错误回头单独修。
-          # 备注3：若还有其他依赖的 engines 限制导致安装失败，
-          #   可临时加 --ignore-engines（仅作为应急，优先调 Node 版本）。
+          # 备注3：--ignore-engines 只绕过声明校验。若某个依赖真的调用了
+          #   Node 22 才有的 API，会在下面 yarn build 阶段直接报错；
+          #   那时把 node-version 改成 '22' 就能解决。
 
       - name: 校验前端产物
         run: |
