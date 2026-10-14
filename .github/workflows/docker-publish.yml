@@ -1,0 +1,191 @@
+# ============================================================================
+# 全程在线构建 dysync 镜像（仅 x86_64）并发布到 GHCR
+#
+#   本地不需要装 Docker / .NET / Node —— 全部在 GitHub runner 上完成。
+#
+# 放置位置：.github/workflows/docker-publish.yml
+#   必须放到 fork 的**默认分支**上，否则 Actions 页面不会出现 Run workflow 按钮。
+#
+# ---------------------------------------------------------------------------
+# 首次使用前要做的三件事：
+#   1. fork 后在 Actions 标签页点一次确认，启用该 fork 的 Actions。
+#   2. Settings → Actions → General → Workflow permissions 选
+#      "Read and write permissions"（否则推包会被拒）。
+#   3. 首次推送成功后，到仓库 Packages 页面把镜像可见性改成 public。
+#
+# 产物：ghcr.io/<你的用户名>/<fork名>:<版本号>   以及打 tag 时更新的 :latest
+# ---------------------------------------------------------------------------
+#
+# 【流程为什么是这两步】
+# 仓库里的 Dockerfile 没有任何编译动作，只有：
+#     COPY . .   +   ENTRYPOINT ["dotnet", "dy.net.dll"]
+# 所以「构建上下文」必须是已经发布好的产物目录：
+#   dotnet publish → 输出到 publish/ → 以 publish/ 为上下文构建镜像。
+#
+# 而这两样东西被 .gitignore 排除、仓库里没有，必须在 CI 里现做：
+#   - appsettings.json : 用 appsettings-arm.json 作模板生成并写入版本号
+#   - app/dist         : app/ 是独立的 Vite 工程，现编译（仓库无锁文件）
+# ============================================================================
+
+name: Build and publish image (amd64)
+
+on:
+  # 手动触发：Actions 页面点 Run workflow，可顺手填版本号
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '镜像版本号（留空则用 tag 名或 commit SHA）'
+        required: false
+        default: ''
+  # 打 v* 标签时自动构建，并同时更新 latest
+  push:
+    tags:
+      - 'v*'
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    name: build and push (amd64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 计算版本号与镜像名
+        id: meta
+        run: |
+          # GHCR 要求镜像路径全小写，而仓库名可能含大写字母
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="sha-${GITHUB_SHA::7}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "repo=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "版本号：${VERSION}"
+          echo "镜像名：ghcr.io/${GITHUB_REPOSITORY,,}"
+
+      - name: 组装镜像标签
+        id: tags
+        run: |
+          BASE="${{ env.REGISTRY }}/${{ steps.meta.outputs.repo }}"
+          {
+            echo "list<<__EOF__"
+            echo "${BASE}:${{ steps.meta.outputs.version }}"
+            # 只有打 tag 触发时才移动 latest，手动构建不会污染它
+            if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+              echo "${BASE}:latest"
+            fi
+            echo "__EOF__"
+          } >> "$GITHUB_OUTPUT"
+
+      # ---------------------------------------------------------------- 后端
+      - name: 安装 .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          # 项目 TargetFramework 是 net6.0；SDK 8 可以发布 net6.0（参考包从 NuGet 取）
+          dotnet-version: 8.0.x
+
+      # ---------------------------------------------------------------- 前端
+      - name: 安装 Node
+        uses: actions/setup-node@v4
+        with:
+          # Vite 4 建议用 Node 18/20，不要用 22
+          node-version: '20'
+          cache: 'yarn'
+          cache-dependency-path: 'app/package.json'
+
+      - name: 编译前端产物到 app/dist
+        working-directory: app
+        run: |
+          # app/.gitignore 忽略了 yarn.lock，仓库里没有锁文件，
+          # 所以不能加 --frozen-lockfile，只能按 package.json 解析安装。
+          yarn install --network-timeout 600000
+          yarn build
+          # 备注1：若 yarn 在 runner 上不可用，换成
+          #   npm install --legacy-peer-deps && npm run build
+          # 备注2：build 脚本是 "vue-tsc --noEmit && vite build"，
+          #   会先做全量类型检查。若因类型错误导致构建中断，
+          #   可临时改成 npx vite build 先跑通，类型错误回头单独修。
+
+      - name: 校验前端产物
+        run: |
+          # csproj 的 PublishRunWebpack 目标按 app/dist/** 收进发布目录，
+          # Program.cs 也从 app/dist 提供 SPA 静态文件。
+          # 少了它镜像照样能启动，但网页界面是空的，而且不会报任何错。
+          test -f app/dist/index.html || { echo "错误：app/dist/index.html 不存在，前端没编译出来"; ls -la app; exit 1; }
+          echo "前端产物大小：$(du -sh app/dist | cut -f1)"
+
+      # ---------------------------------------------------------------- 发布
+      - name: 发布后端到 publish/ 目录
+        run: dotnet publish dy.net.csproj -c Release -o publish
+
+      - name: 生成 appsettings.json
+        run: |
+          cd publish
+
+          # 仓库里没有 appsettings.json（被 .gitignore 排除）。
+          # 用 appsettings-arm.json 作模板：它的配置项与架构无关
+          # （deploy / dbconn / dbtype / tagName / fnVersion / Jwt），可以通用。
+          cp appsettings-arm.json appsettings.json
+
+          # 写入版本号，替换模板里的 "latest"
+          sed -i 's/"tagName": *"[^"]*"/"tagName": "${{ steps.meta.outputs.version }}"/' appsettings.json
+
+          echo "---- 生成后的 appsettings.json ----"
+          cat appsettings.json
+
+      - name: 校验构建上下文
+        run: |
+          # 这两项缺任何一个，Docker 都会静默产出一个坏镜像而不报错，
+          # 所以宁可让流程早点红。
+          test -f publish/dy.net.dll        || { echo "错误：publish/ 缺少 dy.net.dll"; exit 1; }
+          test -f publish/Dockerfile        || { echo "错误：publish/ 缺少 Dockerfile"; exit 1; }
+          test -f publish/app/dist/index.html || { echo "错误：publish/app/dist 缺少前端产物"; exit 1; }
+          echo "构建上下文内容："
+          ls -la publish | head -40
+
+      # ---------------------------------------------------------------- 镜像
+      - name: 启用 Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          # 用内置 token，不需要自己配 secret；权限来自上面的 packages: write
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 构建并推送镜像
+        uses: docker/build-push-action@v6
+        with:
+          context: publish
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.tags.outputs.list }}
+          # 缓存能显著省时间：apt 装 ffmpeg 那一层很贵
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 写入任务摘要
+        run: |
+          {
+            echo "### 镜像已发布"
+            echo ""
+            echo '```'
+            echo "${{ steps.tags.outputs.list }}"
+            echo '```'
+            echo "- 首次使用记得把 Packages 可见性设为 public"
+          } >> "$GITHUB_STEP_SUMMARY"
